@@ -1,5 +1,11 @@
 
 
+import {
+  extractTicketFromPrompt,
+  extractTicketFromParams,
+  ticketProject,
+} from "./ticket-scope.js";
+
 interface PluginLogger {
   debug?: (message: string) => void;
   info: (message: string) => void;
@@ -635,7 +641,10 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   const canonicalSessionKeys = new Map<string, string>();
   const sessionAliasesByCanonicalKey = new Map<string, Set<string>>();
   const recentPromptInits = new Map<string, number>();
-  const syncMemoryFile = userConfig.syncMemoryFile !== false; 
+  // PLATENG-1228 L1: canonicalSessionKey -> "TD-####". First discovery wins;
+  // cleared on gateway_start like the other session maps.
+  const ticketBySessionKey = new Map<string, string>();
+  const syncMemoryFile = userConfig.syncMemoryFile !== false;
   const syncMemoryFileExclude = new Set(userConfig.syncMemoryFileExclude || []);
 
   function getContentSessionId(sessionKey?: string): string {
@@ -690,6 +699,44 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     return { canonicalKey, contentSessionId };
   }
 
+  // PLATENG-1228 L1: read-only canonical-key lookup for the inject path, where
+  // before_agent_start has already registered the session (no alias mutation).
+  function canonicalKeyForCtx(ctx: SessionTrackingContext): string {
+    const aliases = getSessionAliases(ctx);
+    const found = aliases.find((alias) => canonicalSessionKeys.has(alias));
+    return found ? canonicalSessionKeys.get(found)! : aliases[0];
+  }
+
+  // Ticket-aware project resolver — used on BOTH the write/init path and the
+  // inject path so persisted and queried projects always match. Returns the
+  // ticket thread once discovered for this session, else the agent fallback.
+  function resolveProjectName(ctx: EventContext, canonicalKey?: string): string {
+    const key = canonicalKey ?? canonicalKeyForCtx(ctx);
+    const ticket = key ? ticketBySessionKey.get(key) : undefined;
+    return ticket ? ticketProject(ticket) : getProjectName(ctx);
+  }
+
+  // First-discovery record. Specialists call with viaReproject=false BEFORE
+  // initSessionOnce (the INSERT already carries the ticket). The orchestrator
+  // discovers mid-run and calls with viaReproject=true to re-key the
+  // already-created session on the worker.
+  function rememberTicket(
+    canonicalKey: string,
+    contentSessionId: string,
+    ticket: string,
+    viaReproject: boolean,
+  ): void {
+    if (ticketBySessionKey.has(canonicalKey)) return; // one-shot per session
+    ticketBySessionKey.set(canonicalKey, ticket);
+    api.logger.info(`[claude-mem] Ticket scope discovered: session=${canonicalKey} ticket=${ticket} reproject=${viaReproject}`);
+    if (viaReproject) {
+      workerPostFireAndForget(workerPort, "/api/sessions/project", {
+        contentSessionId,
+        project: ticketProject(ticket),
+      }, api.logger);
+    }
+  }
+
   function shouldSkipDuplicatePromptInit(contentSessionId: string, project: string, prompt: string): boolean {
     const now = Date.now();
     for (const [key, timestamp] of recentPromptInits) {
@@ -720,7 +767,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
 
   async function getContextForPrompt(ctx?: EventContext): Promise<string | null> {
     const projects = [baseProjectName];
-    const agentProject = ctx ? getProjectName(ctx) : null;
+    const agentProject = ctx ? resolveProjectName(ctx) : null;
     if (agentProject && agentProject !== baseProjectName) {
       projects.push(agentProject);
     }
@@ -750,8 +797,8 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   // user-message flow produces into one prompt record, while still ensuring a
   // session is initialized even on flows that never reach before_agent_start.
   async function initSessionOnce(ctx: EventContext, promptText: string, via: string): Promise<void> {
-    const { contentSessionId } = rememberSessionContext(ctx);
-    const projectName = getProjectName(ctx);
+    const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
+    const projectName = resolveProjectName(ctx, canonicalKey);
 
     if (shouldSkipDuplicatePromptInit(contentSessionId, projectName, promptText)) {
       api.logger.info(`[claude-mem] Skipping duplicate prompt init: contentSessionId=${contentSessionId} project=${projectName} via=${via}`);
@@ -781,6 +828,13 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   });
 
   api.on("before_agent_start", async (event, ctx) => {
+    // Specialists carry the ticket in their spawn prompt — record it BEFORE
+    // init so the session INSERTs directly under openclaw-TD-####.
+    const ticket = extractTicketFromPrompt(event.prompt);
+    if (ticket) {
+      const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
+      rememberTicket(canonicalKey, contentSessionId, ticket, false);
+    }
     await initSessionOnce(ctx, event.prompt || "agent run", "before_agent_start");
   });
 
@@ -802,6 +856,13 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     if (toolName.startsWith("memory_")) return;
 
     const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
+
+    // Orchestrator discovers its ticket mid-run via the worktree path in an
+    // exec command — re-key the already-created session on first sighting.
+    const ticket = extractTicketFromParams(event.params);
+    if (ticket) {
+      rememberTicket(canonicalKey, contentSessionId, ticket, true);
+    }
 
     let toolResponseText = "";
     const content = event.message?.content;
@@ -872,6 +933,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     recentPromptInits.clear();
     canonicalSessionKeys.clear();
     sessionAliasesByCanonicalKey.clear();
+    ticketBySessionKey.clear();
     api.logger.info("[claude-mem] Gateway started — session tracking reset");
   });
 

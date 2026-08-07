@@ -2439,6 +2439,23 @@ export class SessionStore {
   }
 
   /**
+   * PLATENG-1228 L1: unconditional project re-key by content session id.
+   * Unlike createSDKSession's NULL/empty-guarded backfill, this overwrites an
+   * already-set project (openclaw-{agentId} -> openclaw-TD-####). Returns the
+   * affected sdk_sessions row id, or null if no matching session exists.
+   */
+  updateSessionProject(
+    contentSessionId: string,
+    project: string,
+    platformSource?: string
+  ): number | null {
+    const sessionDbId = this.resolvePromptSessionDbId(contentSessionId, undefined, platformSource);
+    if (sessionDbId === null) return null;
+    this.db.prepare('UPDATE sdk_sessions SET project = ? WHERE id = ?').run(project, sessionDbId);
+    return sessionDbId;
+  }
+
+  /**
    * Custom-title mutation op (plan Phase 3 task 2). sdk_sessions rows do not
    * sync, so there is no sync_rev to bump and no synced_at to null — the
    * title travels ONLY as a set_title mutation op. Per the SyncApply REV

@@ -265,6 +265,12 @@ describe("Observation I/O event handlers", () => {
             return;
           }
 
+          if (req.url === "/api/sessions/project") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ updated: true }));
+            return;
+          }
+
           if (req.url?.startsWith("/api/context/inject")) {
             res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
             res.end("# Claude-Mem Context\n\n## Timeline\n- Session 1: Did some work");
@@ -350,6 +356,84 @@ describe("Observation I/O event handlers", () => {
 
     const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
     assert.equal(initRequests.length, 1, "before_agent_start should init session");
+  });
+
+  // PLATENG-1228 L1: ticket-scoped memory (openclaw-TD-####).
+  it("before_agent_start keys a specialist session to its ticket project", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent(
+      "before_agent_start",
+      { prompt: "You are the new-step-reviewer for ticket TD-1234. Review the diff." },
+      { sessionKey: "spec-1", agentId: "new-step-reviewer" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const initRequest = receivedRequests.find((r) => r.url === "/api/sessions/init");
+    assert.ok(initRequest, "should init the specialist session");
+    assert.equal(initRequest!.body.project, "openclaw-TD-1234");
+  });
+
+  it("tool_result_persist re-keys the orchestrator session via a reproject POST", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent(
+      "tool_result_persist",
+      {
+        toolName: "Bash",
+        params: { command: "cd /home/node/work/.integrations-worktrees/TD-2001/repo && ls" },
+        message: { content: [] },
+      },
+      { sessionKey: "orch-1", agentId: "new-step-orchestrator" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const reprojectRequest = receivedRequests.find((r) => r.url === "/api/sessions/project");
+    assert.ok(reprojectRequest, "should reproject the orchestrator session");
+    assert.equal(reprojectRequest!.body.project, "openclaw-TD-2001");
+  });
+
+  it("leaves a non-build agent under its agent project and never reprojects", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent(
+      "before_agent_start",
+      { prompt: "Select the next integration to build." },
+      { sessionKey: "main-1", agentId: "triage-desk-analyst" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const initRequest = receivedRequests.find((r) => r.url === "/api/sessions/init");
+    assert.ok(initRequest, "should init the non-build session");
+    assert.equal(initRequest!.body.project, "openclaw-triage-desk-analyst");
+    assert.ok(
+      !receivedRequests.some((r) => r.url === "/api/sessions/project"),
+      "non-build agent must not reproject",
+    );
+  });
+
+  it("injects context under the ticket project after discovery (read == write)", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    const ctx = { sessionKey: "spec-2", agentId: "new-step-coder" };
+    // Discover the ticket from the spawn prompt...
+    await fireEvent(
+      "before_agent_start",
+      { prompt: "You are the new-step-coder for ticket TD-1234, iteration 2." },
+      ctx,
+    );
+    // ...then the very next prompt build must query the same ticket thread.
+    await fireEvent("before_prompt_build", {}, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const injectRequest = receivedRequests.find(
+      (r) => r.url.startsWith("/api/context/inject") && r.url.includes("openclaw-TD-1234"),
+    );
+    assert.ok(injectRequest, "inject query should include the ticket project");
   });
 
   it("tool_result_persist sends observation to worker", async () => {

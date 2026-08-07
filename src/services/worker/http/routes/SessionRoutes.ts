@@ -2,6 +2,7 @@
 import express, { Request, Response } from 'express';
 import { z } from 'zod';
 import { ingestObservation } from '../shared.js';
+import { reprojectSession } from '../reproject-session.js';
 import { validateBody } from '../middleware/validateBody.js';
 import { logger } from '../../../../utils/logger.js';
 import { stripMemoryTags, isInternalProtocolPayload } from '../../../../utils/tag-stripping.js';
@@ -275,6 +276,11 @@ export class SessionRoutes extends BaseRouteHandler {
       validateBody(SessionRoutes.summarizeByClaudeIdSchema),
       this.handleSummarizeByClaudeId.bind(this)
     );
+    app.post(
+      '/api/sessions/project',
+      validateBody(SessionRoutes.sessionProjectByClaudeIdSchema),
+      this.handleSessionProjectByClaudeId.bind(this)
+    );
   }
 
   private static readonly sessionInitByClaudeIdSchema = z.object({
@@ -302,6 +308,12 @@ export class SessionRoutes extends BaseRouteHandler {
     contentSessionId: z.string().min(1),
     last_assistant_message: z.string().optional(),
     agentId: z.string().optional(),
+    platformSource: z.string().optional(),
+  }).passthrough();
+
+  private static readonly sessionProjectByClaudeIdSchema = z.object({
+    contentSessionId: z.string().min(1),
+    project: z.string().min(1),
     platformSource: z.string().optional(),
   }).passthrough();
 
@@ -342,6 +354,27 @@ export class SessionRoutes extends BaseRouteHandler {
     }
 
     res.json({ status: 'queued' });
+  });
+
+  // PLATENG-1228 L1: re-key an existing session to its ticket project. The
+  // orchestrator plugin calls this once it discovers the ticket mid-run.
+  private handleSessionProjectByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
+    const { contentSessionId, project } = req.body;
+    const platformSource = this.getPlatformSourceFromRequest(req);
+
+    const result = reprojectSession(
+      this.dbManager.getSessionStore(),
+      (sessionDbId) => this.sessionManager.getSession(sessionDbId),
+      { contentSessionId, project, platformSource },
+    );
+
+    if (result.updated) {
+      logger.info('SESSION', `REPROJECT | contentSessionId=${contentSessionId} -> sessionDbId=${result.sessionDbId} | project=${project}`, {
+        sessionId: result.sessionDbId,
+      });
+    }
+
+    res.json(result);
   });
 
   private handleSummarizeByClaudeId = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {

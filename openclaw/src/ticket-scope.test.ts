@@ -43,8 +43,28 @@ describe('extractTicketFromParams', () => {
     assert.equal(extractTicketFromParams(params), 'TD-6523');
   });
 
+  it('extracts the ticket from a web-app worktree path', () => {
+    const params = { command: 'cd /home/node/work/.web-app-worktrees/TD-9876/web-app && npm run lint' };
+    assert.equal(extractTicketFromParams(params), 'TD-9876');
+  });
+
+  it('extracts the ticket from a docs worktree path', () => {
+    const params = { command: 'cd /home/node/work/.docs-worktrees/TD-5555/docs && git diff' };
+    assert.equal(extractTicketFromParams(params), 'TD-5555');
+  });
+
+  it('extracts the ticket from a trash worktree path', () => {
+    const params = { workdir: '/home/node/work/.trash-worktrees/TD-4321/graph-acme' };
+    assert.equal(extractTicketFromParams(params), 'TD-4321');
+  });
+
   it('ignores an incidental TD-#### not under a worktree path', () => {
     const params = { command: 'echo "resolves TD-9999" >> notes.txt' };
+    assert.equal(extractTicketFromParams(params), null);
+  });
+
+  it('ignores an incidental TD-#### in a git command', () => {
+    const params = { command: 'git log --grep TD-1234' };
     assert.equal(extractTicketFromParams(params), null);
   });
 

@@ -4,14 +4,15 @@
 //
 // Two discovery sources: specialists carry the ticket in their spawn prompt;
 // the orchestrator only references it via the worktree path in exec commands.
-// The worktree matcher is anchored on ".integrations-worktrees/" so incidental
-// "TD-####" mentions in command text or output do not falsely re-key a build.
+// The worktree matcher accepts any ".<base>-worktrees/" — jupiterclaw adds a
+// base per pipeline — but keeps the path anchor so incidental "TD-####"
+// mentions in command text or output do not falsely re-key a build.
 
 /** Bare ticket reference — used only for specialist spawn prompts. */
 export const TICKET_IN_PROMPT = /\b(TD-\d+)\b/;
 
-/** Ticket anchored to an integration worktree path — used for exec params. */
-export const TICKET_IN_WORKTREE = /\.integrations-worktrees\/(TD-\d+)/;
+/** Ticket anchored to any worktree path — used for exec params. */
+export const TICKET_IN_WORKTREE = /\.[a-z-]+-worktrees\/(TD-\d+)/;
 
 /** Format a ticket into the claude-mem `openclaw-` project convention. */
 export function ticketProject(ticket: string): string {
@@ -25,9 +26,9 @@ export function extractTicketFromPrompt(prompt: unknown): string | null {
 }
 
 /**
- * Extract the ticket from a tool-params object by finding an integration
- * worktree path — params.command first, then any other string leaf. Returns
- * null if no worktree-anchored ticket is present.
+ * Extract the ticket from a tool-params object by finding a worktree path —
+ * params.command first, then any other string leaf. Returns null if no
+ * worktree-anchored ticket is present.
  */
 export function extractTicketFromParams(params: unknown): string | null {
   if (!params || typeof params !== 'object') return null;

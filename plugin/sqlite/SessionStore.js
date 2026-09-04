@@ -769,7 +769,7 @@ ${O.stack??""}
       INSERT INTO sdk_sessions
       (content_session_id, memory_session_id, project, platform_source, user_prompt, custom_title, started_at, started_at_epoch, status)
       VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'active')
-    `).run(e,t,_,c,n||null,o.toISOString(),a);return n&&this.enqueueSetTitleOp(e,_,n),Number(l.lastInsertRowid)}enqueueSetTitleOp(e,t,s){let n=this.validateSetTitleMutation(e,t,s);this.enqueueMutationOp("1",n)}validateSetTitleMutation(e,t,s){let n={op:"set_title",target:{content_session_id:e,platform_source:t},fields:{custom_title:s}};return J(n),n}saveUserPrompt(e,t,s,n){let r=new Date,o=r.getTime(),a=P(s),_=this.resolvePromptSessionDbId(e,n);return this.db.prepare(`
+    `).run(e,t,_,c,n||null,o.toISOString(),a);return n&&this.enqueueSetTitleOp(e,_,n),Number(l.lastInsertRowid)}updateSessionProject(e,t,s){let n=this.resolvePromptSessionDbId(e,void 0,s);return n===null?null:(this.db.prepare("UPDATE sdk_sessions SET project = ? WHERE id = ?").run(t,n),n)}enqueueSetTitleOp(e,t,s){let n=this.validateSetTitleMutation(e,t,s);this.enqueueMutationOp("1",n)}validateSetTitleMutation(e,t,s){let n={op:"set_title",target:{content_session_id:e,platform_source:t},fields:{custom_title:s}};return J(n),n}saveUserPrompt(e,t,s,n){let r=new Date,o=r.getTime(),a=P(s),_=this.resolvePromptSessionDbId(e,n);return this.db.prepare(`
       INSERT INTO user_prompts
       (session_db_id, content_session_id, prompt_number, prompt_text, created_at, created_at_epoch)
       VALUES (?, ?, ?, ?, ?, ?)

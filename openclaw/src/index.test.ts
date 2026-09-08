@@ -322,7 +322,7 @@ describe("Observation I/O event handlers", () => {
     const initRequest = receivedRequests.find((r) => r.url === "/api/sessions/init");
     assert.ok(initRequest, "should send init request to worker");
     assert.equal(initRequest!.body.project, "openclaw");
-    assert.ok(initRequest!.body.contentSessionId.startsWith("openclaw-agent-1-"));
+    assert.equal(initRequest!.body.contentSessionId, "openclaw-agent-1");
     assert.ok(logs.some((l) => l.includes("Session initialized")));
   });
 
@@ -448,6 +448,135 @@ describe("Observation I/O event handlers", () => {
     const reprojectRequest = receivedRequests.find((r) => r.url === "/api/sessions/project");
     assert.ok(reprojectRequest, "should reproject the orchestrator session");
     assert.equal(reprojectRequest!.body.project, "openclaw-TD-2001");
+  });
+
+  async function waitForRequests(
+    predicate: (request: { method: string; url: string; body: any }) => boolean,
+    count = 1,
+    timeoutMs = 3000,
+  ): Promise<Array<{ method: string; url: string; body: any }>> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const hits = receivedRequests.filter(predicate);
+      if (hits.length >= count || Date.now() > deadline) return hits;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  // A generated id cannot be re-derived, so any path that misses the cache
+  // mints a second session under the ticket instead of moving the first.
+  it("derives one stable contentSessionId per session, independent of plugin state", async () => {
+    const first = createMockApi({ workerPort });
+    claudeMemPlugin(first.api);
+    await first.fireEvent(
+      "session_start",
+      { sessionId: "s-1" },
+      { sessionKey: "agent:main:tick-1", sessionId: "s-1" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const second = createMockApi({ workerPort });
+    claudeMemPlugin(second.api);
+    await second.fireEvent(
+      "session_start",
+      { sessionId: "s-1" },
+      { sessionKey: "agent:main:tick-1", sessionId: "s-1" },
+    );
+
+    const ids = (await waitForRequests((r) => r.url === "/api/sessions/init", 2))
+      .map((r) => r.body.contentSessionId);
+    assert.equal(ids.length, 2, `expected two inits, got ${JSON.stringify(ids)}`);
+    assert.equal(ids[0], ids[1], "one session key must always resolve to one content session id");
+    assert.equal(ids[0], "openclaw-agent:main:tick-1");
+  });
+
+  it("re-keys the discovered ticket instead of initializing a second session", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    const ctx = { sessionKey: "agent:main:tick-1", sessionId: "s-1", agentId: "main" };
+    await fireEvent("session_start", { sessionId: "s-1" }, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    await fireEvent(
+      "before_tool_call",
+      {
+        toolName: "exec",
+        params: { command: "cd /home/node/work/.integrations-worktrees/TD-10849/repo && ls" },
+      },
+      ctx,
+    );
+    const [reproject] = await waitForRequests((r) => r.url === "/api/sessions/project");
+
+    const initIds = new Set(
+      receivedRequests.filter((r) => r.url === "/api/sessions/init").map((r) => r.body.contentSessionId),
+    );
+    assert.equal(initIds.size, 1, `discovery minted a second session: ${[...initIds].join(", ")}`);
+
+    assert.ok(reproject, "the ticket must land through the reproject endpoint");
+    assert.equal(reproject!.body.contentSessionId, [...initIds][0]);
+    assert.equal(reproject!.body.project, "openclaw-TD-10849");
+  });
+
+  // Channel and conversation aliases outlive the tick that registered them.
+  // A new tick on the same agent must not inherit the previous tick's session.
+  it("before_prompt_build resolves the running session, not the previous tick's", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent(
+      "before_prompt_build",
+      { prompt: "You are the new-step-coder for ticket TD-1234.", messages: [] },
+      { sessionKey: "agent:main:tick-1", sessionId: "s-1", agentId: "new-step-coder", channelId: "chan-1" },
+    );
+
+    const tick1Id = (await waitForRequests((r) => r.url === "/api/sessions/init"))
+      .map((r) => r.body.contentSessionId)
+      .pop();
+    assert.ok(tick1Id, "tick 1 should have initialized a session");
+    receivedRequests = [];
+
+    await fireEvent(
+      "before_prompt_build",
+      { prompt: "Continue where the last tick left off.", messages: [] },
+      { sessionKey: "agent:main:tick-2", sessionId: "s-2", agentId: "new-step-coder", channelId: "chan-1" },
+    );
+
+    const [tick2Init] = await waitForRequests((r) => r.url === "/api/sessions/init");
+    assert.ok(tick2Init, "tick 2 should initialize its own session");
+    assert.notEqual(
+      tick2Init!.body.contentSessionId,
+      tick1Id,
+      "tick 2 reused the previous tick's content session id",
+    );
+    assert.equal(
+      tick2Init!.body.project,
+      "openclaw-new-step-coder",
+      "tick 2 has discovered no ticket of its own; the previous tick's must not leak",
+    );
+  });
+
+  it("resolves a session by sessionId when the hook carries no session key", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent(
+      "session_start",
+      { sessionId: "s-1" },
+      { sessionKey: "agent:main:tick-1", sessionId: "s-1" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    await fireEvent(
+      "tool_result_persist",
+      { toolName: "Read", message: { content: [{ type: "text", text: "contents" }] } },
+      { sessionId: "s-1" },
+    );
+    const [obsRequest] = await waitForRequests((r) => r.url === "/api/sessions/observations");
+
+    const initRequest = receivedRequests.find((r) => r.url === "/api/sessions/init");
+    assert.ok(initRequest && obsRequest, "both requests should exist");
+    assert.equal(obsRequest!.body.contentSessionId, initRequest!.body.contentSessionId);
   });
 
   it("before_tool_call never blocks or rewrites the tool call", async () => {
@@ -595,7 +724,7 @@ describe("Observation I/O event handlers", () => {
     assert.equal(obsRequest!.body.tool_name, "Read");
     assert.deepEqual(obsRequest!.body.tool_input, { file_path: "/src/index.ts" });
     assert.equal(obsRequest!.body.tool_response, "file contents here...");
-    assert.ok(obsRequest!.body.contentSessionId.startsWith("openclaw-test-agent-"));
+    assert.equal(obsRequest!.body.contentSessionId, "openclaw-test-agent");
   });
 
   it("tool_result_persist skips memory_ tools", async () => {
@@ -652,7 +781,7 @@ describe("Observation I/O event handlers", () => {
     const summarizeRequest = receivedRequests.find((r) => r.url === "/api/sessions/summarize");
     assert.ok(summarizeRequest, "should send summarize to worker");
     assert.equal(summarizeRequest!.body.last_assistant_message, "Here is the solution...");
-    assert.ok(summarizeRequest!.body.contentSessionId.startsWith("openclaw-summarize-test-"));
+    assert.equal(summarizeRequest!.body.contentSessionId, "openclaw-summarize-test");
 
     const completeRequest = receivedRequests.find((r) => r.url === "/api/sessions/complete");
     assert.ok(!completeRequest, "should not send complete (worker self-completes)");

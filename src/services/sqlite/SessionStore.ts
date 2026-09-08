@@ -2439,6 +2439,17 @@ export class SessionStore {
   }
 
   /**
+   * PLATENG-1228 L1: the project a session is already keyed to. Callers that
+   * have no path to derive one from (an OpenClaw gateway turn carries no
+   * workspace dir) read it back rather than recomputing it.
+   */
+  getSessionProject(contentSessionId: string, platformSource?: string): string | null {
+    const sessionDbId = this.resolvePromptSessionDbId(contentSessionId, undefined, platformSource);
+    if (sessionDbId === null) return null;
+    return this.getSessionById(sessionDbId)?.project || null;
+  }
+
+  /**
    * PLATENG-1228 L1: unconditional project re-key by content session id.
    * Unlike createSDKSession's NULL/empty-guarded backfill, this overwrites an
    * already-set project (openclaw-{agentId} -> openclaw-TD-####). Returns the

@@ -97,6 +97,7 @@ interface MessageReceivedEvent {
 
 interface EventContext {
   sessionKey?: string;
+  sessionId?: string;
   workspaceDir?: string;
   agentId?: string;
 }
@@ -646,7 +647,6 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     return baseProjectName;
   }
 
-  const sessionIds = new Map<string, string>();
   const canonicalSessionKeys = new Map<string, string>();
   const sessionAliasesByCanonicalKey = new Map<string, Set<string>>();
   const recentPromptInits = new Map<string, number>();
@@ -656,12 +656,11 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   const syncMemoryFile = userConfig.syncMemoryFile !== false;
   const syncMemoryFileExclude = new Set(userConfig.syncMemoryFileExclude || []);
 
+  // PLATENG-1228 L1: derived, never generated. A generated id cannot be
+  // re-derived, so a hook that missed the cache minted a second worker session
+  // under the ticket instead of re-keying the one already open.
   function getContentSessionId(sessionKey?: string): string {
-    const key = sessionKey || "default";
-    if (!sessionIds.has(key)) {
-      sessionIds.set(key, `openclaw-${key}-${Date.now()}`);
-    }
-    return sessionIds.get(key)!;
+    return `openclaw-${sessionKey || "default"}`;
   }
 
   function shouldInjectContext(ctx?: EventContext): boolean {
@@ -673,6 +672,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
 
   type SessionTrackingContext = {
     sessionKey?: string;
+    sessionId?: string;
     workspaceDir?: string;
     channelId?: string;
     conversationId?: string;
@@ -680,7 +680,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
 
   function getSessionAliases(ctx: SessionTrackingContext): string[] {
     const aliases = new Set<string>();
-    for (const rawKey of [ctx.sessionKey, ctx.conversationId, ctx.channelId]) {
+    for (const rawKey of [ctx.sessionKey, ctx.sessionId, ctx.conversationId, ctx.channelId]) {
       const key = typeof rawKey === "string" ? rawKey.trim() : "";
       if (key) aliases.add(key);
     }
@@ -688,10 +688,28 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     return Array.from(aliases);
   }
 
+  // A session identity settles the canonical key on its own; the alias scan is
+  // only for channel events that carry neither. The order is load-bearing — a
+  // channel alias outlives the tick that registered it, so letting one answer
+  // first bound each new tick of an agent to the previous tick's session.
+  function sessionIdentity(ctx: SessionTrackingContext): string | undefined {
+    for (const raw of [ctx.sessionKey, ctx.sessionId]) {
+      const value = typeof raw === "string" ? raw.trim() : "";
+      if (value) return value;
+    }
+    return undefined;
+  }
+
+  function resolveCanonicalKey(ctx: SessionTrackingContext, aliases: string[]): string {
+    const identity = sessionIdentity(ctx);
+    if (identity) return canonicalSessionKeys.get(identity) ?? identity;
+    const known = aliases.find((alias) => canonicalSessionKeys.has(alias));
+    return known ? canonicalSessionKeys.get(known)! : aliases[0];
+  }
+
   function rememberSessionContext(ctx: SessionTrackingContext): { canonicalKey: string; contentSessionId: string } {
     const aliases = getSessionAliases(ctx);
-    let canonicalKey = aliases.find((alias) => canonicalSessionKeys.has(alias));
-    canonicalKey = canonicalKey ? canonicalSessionKeys.get(canonicalKey)! : aliases[0];
+    const canonicalKey = resolveCanonicalKey(ctx, aliases);
     let aliasSet = sessionAliasesByCanonicalKey.get(canonicalKey);
     if (!aliasSet) {
       aliasSet = new Set([canonicalKey]);
@@ -701,19 +719,13 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
       aliasSet.add(alias);
       canonicalSessionKeys.set(alias, canonicalKey);
     }
-    const contentSessionId = getContentSessionId(canonicalKey);
-    for (const alias of aliasSet) {
-      sessionIds.set(alias, contentSessionId);
-    }
-    return { canonicalKey, contentSessionId };
+    return { canonicalKey, contentSessionId: getContentSessionId(canonicalKey) };
   }
 
   // PLATENG-1228 L1: read-only canonical-key lookup for the inject path, where
   // an earlier hook has already registered the session (no alias mutation).
   function canonicalKeyForCtx(ctx: SessionTrackingContext): string {
-    const aliases = getSessionAliases(ctx);
-    const found = aliases.find((alias) => canonicalSessionKeys.has(alias));
-    return found ? canonicalSessionKeys.get(found)! : aliases[0];
+    return resolveCanonicalKey(ctx, getSessionAliases(ctx));
   }
 
   // Ticket-aware project resolver — used on BOTH the write/init path and the
@@ -759,16 +771,12 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
 
   function clearSessionContext(ctx: SessionTrackingContext): void {
     const aliases = getSessionAliases(ctx);
-    const canonicalKey = aliases
-      .map((alias) => canonicalSessionKeys.get(alias))
-      .find(Boolean) || aliases[0];
+    const canonicalKey = resolveCanonicalKey(ctx, aliases);
     const knownAliases = sessionAliasesByCanonicalKey.get(canonicalKey) || new Set([canonicalKey, ...aliases]);
     for (const alias of knownAliases) {
       canonicalSessionKeys.delete(alias);
-      sessionIds.delete(alias);
     }
     sessionAliasesByCanonicalKey.delete(canonicalKey);
-    sessionIds.delete(canonicalKey);
   }
 
   const CONTEXT_CACHE_TTL_MS = 60_000;
@@ -942,7 +950,6 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
 
   api.on("gateway_start", async () => {
     circuitReset();
-    sessionIds.clear();
     contextCache.clear();
     recentPromptInits.clear();
     canonicalSessionKeys.clear();
@@ -1199,7 +1206,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
           "Claude-Mem Worker Status",
           `Status: ${health.status || "unknown"}`,
           `Port: ${workerPort}`,
-          `Active sessions: ${sessionIds.size}`,
+          `Active sessions: ${sessionAliasesByCanonicalKey.size}`,
           `Observation feed: ${connectionState}`,
         ].join("\n") };
       } catch {

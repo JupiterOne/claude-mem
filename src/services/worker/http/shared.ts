@@ -59,7 +59,14 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
 
   const platformSource = normalizePlatformSource(payload.platformSource);
   const cwd = typeof payload.cwd === 'string' ? payload.cwd : '';
-  const project = cwd.trim() ? getProjectContext(cwd).primary : '';
+  const store = dbManager.getSessionStore();
+  // A cwd is optional: OpenClaw gateway turns carry no workspace dir, and any
+  // substitute path resolves to a project the inject path never queries. The
+  // session row is already keyed to the right project, so read it back rather
+  // than recompute it.
+  const project = cwd.trim()
+    ? getProjectContext(cwd).primary
+    : (store.getSessionProject(payload.contentSessionId, platformSource) ?? '');
 
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
@@ -82,8 +89,6 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
       return { ok: true, status: 'skipped', reason: 'session_memory_meta' };
     }
   }
-
-  const store = dbManager.getSessionStore();
 
   let sessionDbId: number;
   let promptNumber: number;
@@ -123,13 +128,7 @@ export async function ingestObservation(payload: ObservationPayload): Promise<In
     tool_input: cleanedToolInput,
     tool_response: cleanedToolResponse,
     prompt_number: promptNumber,
-    cwd: cwd || (() => {
-      logger.error('INGEST', 'Missing cwd when ingesting observation', {
-        sessionId: sessionDbId,
-        toolName: payload.toolName,
-      });
-      return '';
-    })(),
+    cwd,
     agentId: typeof payload.agentId === 'string' ? payload.agentId : undefined,
     agentType: typeof payload.agentType === 'string' ? payload.agentType : undefined,
     toolUseId: typeof payload.toolUseId === 'string' ? payload.toolUseId : undefined,

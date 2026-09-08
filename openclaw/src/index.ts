@@ -31,13 +31,21 @@ interface PluginCommandContext {
 
 type PluginCommandResult = string | { text: string } | { text: string; format?: string };
 
-interface BeforeAgentStartEvent {
-  prompt?: string;
+/**
+ * OpenClaw 2026.8.1 `before_tool_call`. This is the only tool hook that still
+ * carries `params` — `tool_result_persist` dropped them — so it is where the
+ * orchestrator's worktree path is visible.
+ */
+interface BeforeToolCallEvent {
+  toolName?: string;
+  params?: Record<string, unknown>;
+  runId?: string;
+  toolCallId?: string;
 }
 
 interface BeforePromptBuildEvent {
-  prompt: string;
-  messages: unknown[];
+  prompt?: string;
+  messages?: unknown[];
 }
 
 interface BeforePromptBuildResult {
@@ -49,6 +57,7 @@ interface BeforePromptBuildResult {
 
 interface ToolResultPersistEvent {
   toolName?: string;
+  /** Absent on 2026.8.1; kept optional so older gateways still populate it. */
   params?: Record<string, unknown>;
   message?: {
     content?: Array<{ type: string; text?: string }>;
@@ -123,7 +132,7 @@ interface OpenClawPluginApi {
     handler: (ctx: PluginCommandContext) => PluginCommandResult | Promise<PluginCommandResult>;
   }) => void;
   on: ((event: "before_prompt_build", callback: PromptBuildCallback) => void) &
-      ((event: "before_agent_start", callback: EventCallback<BeforeAgentStartEvent>) => void) &
+      ((event: "before_tool_call", callback: EventCallback<BeforeToolCallEvent>) => void) &
       ((event: "tool_result_persist", callback: EventCallback<ToolResultPersistEvent>) => void) &
       ((event: "agent_end", callback: EventCallback<AgentEndEvent>) => void) &
       ((event: "session_start", callback: EventCallback<SessionStartEvent>) => void) &
@@ -700,7 +709,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   }
 
   // PLATENG-1228 L1: read-only canonical-key lookup for the inject path, where
-  // before_agent_start has already registered the session (no alias mutation).
+  // an earlier hook has already registered the session (no alias mutation).
   function canonicalKeyForCtx(ctx: SessionTrackingContext): string {
     const aliases = getSessionAliases(ctx);
     const found = aliases.find((alias) => canonicalSessionKeys.has(alias));
@@ -792,10 +801,10 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
   }
 
   // Centralized session-init POST. session_start, after_compaction, and
-  // before_agent_start each call this; the 2s dedup guard
+  // before_prompt_build each call this; the 2s dedup guard
   // (shouldSkipDuplicatePromptInit) collapses the redundant inits a single
   // user-message flow produces into one prompt record, while still ensuring a
-  // session is initialized even on flows that never reach before_agent_start.
+  // session is initialized even on flows that never reach before_prompt_build.
   async function initSessionOnce(ctx: EventContext, promptText: string, via: string): Promise<void> {
     const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
     const projectName = resolveProjectName(ctx, canonicalKey);
@@ -820,25 +829,29 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
 
   api.on("message_received", async (event, ctx) => {
     const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
-    api.logger.info(`[claude-mem] Message received — prompt capture deferred to before_agent_start: session=${canonicalKey} contentSessionId=${contentSessionId} hasContent=${Boolean(event.content)}`);
+    api.logger.info(`[claude-mem] Message received — prompt capture deferred to before_prompt_build: session=${canonicalKey} contentSessionId=${contentSessionId} hasContent=${Boolean(event.content)}`);
   });
 
   api.on("after_compaction", async (_event, ctx) => {
     await initSessionOnce(ctx, "after compaction", "after_compaction");
   });
 
-  api.on("before_agent_start", async (event, ctx) => {
-    // Specialists carry the ticket in their spawn prompt — record it BEFORE
-    // init so the session INSERTs directly under openclaw-TD-####.
+  // The turn's real prompt reaches the plugin here and nowhere else on
+  // 2026.8.1. Discovery, init and inject therefore share one handler, in that
+  // order: the ticket must be known before initSessionOnce picks a project and
+  // before getContextForPrompt builds the inject query, or the write and read
+  // scopes disagree for this turn.
+  api.on("before_prompt_build", async (event, ctx) => {
     const ticket = extractTicketFromPrompt(event.prompt);
     if (ticket) {
       const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
-      rememberTicket(canonicalKey, contentSessionId, ticket, false);
+      // session_start already INSERTed this session under the agent project,
+      // so the ticket has to move it rather than name it at creation.
+      rememberTicket(canonicalKey, contentSessionId, ticket, true);
     }
-    await initSessionOnce(ctx, event.prompt || "agent run", "before_agent_start");
-  });
 
-  api.on("before_prompt_build", async (_event, ctx) => {
+    await initSessionOnce(ctx, event.prompt || "agent run", "before_prompt_build");
+
     if (!shouldInjectContext(ctx)) return;
 
     const contextText = await getContextForPrompt(ctx);
@@ -848,6 +861,17 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     }
   });
 
+  // Orchestrators never name their ticket in the prompt — it only appears as a
+  // worktree path in an exec command. Observation-only: returning undefined
+  // keeps the hook runner from merging a result, so it can never block or
+  // rewrite a tool call.
+  api.on("before_tool_call", (event, ctx) => {
+    const ticket = extractTicketFromParams(event.params);
+    if (!ticket) return;
+    const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
+    rememberTicket(canonicalKey, contentSessionId, ticket, true);
+  });
+
   api.on("tool_result_persist", (event, ctx) => {
     api.logger.info(`[claude-mem] tool_result_persist fired: tool=${event.toolName ?? "unknown"} agent=${ctx.agentId ?? "none"} session=${ctx.sessionKey ?? "none"}`);
     const toolName = event.toolName;
@@ -855,14 +879,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
 
     if (toolName.startsWith("memory_")) return;
 
-    const { canonicalKey, contentSessionId } = rememberSessionContext(ctx);
-
-    // Orchestrator discovers its ticket mid-run via the worktree path in an
-    // exec command — re-key the already-created session on first sighting.
-    const ticket = extractTicketFromParams(event.params);
-    if (ticket) {
-      rememberTicket(canonicalKey, contentSessionId, ticket, true);
-    }
+    const { contentSessionId } = rememberSessionContext(ctx);
 
     let toolResponseText = "";
     const content = event.message?.content;
@@ -878,19 +895,16 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
       toolResponseText = toolResponseText.slice(0, MAX_TOOL_RESPONSE_LENGTH);
     }
 
-    // Fall back to the process cwd when the event carries no workspaceDir, so a
-    // missing ctx field never silently drops a captured observation.
-    const workspaceDir = ctx.workspaceDir || process.cwd();
-    if (!ctx.workspaceDir) {
-      api.logger.info(`[claude-mem] tool_result_persist missing workspaceDir; using process.cwd(): session=${canonicalKey} tool=${toolName}`);
-    }
-
+    // Never substitute a cwd. The worker derives the observation's project from
+    // it, so process.cwd() (/app in the gateway image) filed observations under
+    // a phantom "app" project that the inject path never queries. Omitted, the
+    // worker leaves the session's existing project alone.
     workerPostFireAndForget(workerPort, "/api/sessions/observations", {
       contentSessionId,
       tool_name: toolName,
       tool_input: event.params || {},
       tool_response: toolResponseText,
-      cwd: workspaceDir,
+      ...(ctx.workspaceDir ? { cwd: ctx.workspaceDir } : {}),
     }, api.logger);
   });
 

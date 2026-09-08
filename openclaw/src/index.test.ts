@@ -85,6 +85,7 @@ function createMockApi(pluginConfigOverride: Record<string, any> = {}) {
       return registeredCommands.get("claude_mem_feed");
     },
     getEventHandlers: (event: string) => eventHandlers.get(event) || [],
+    getRegisteredEvents: () => Array.from(eventHandlers.keys()),
     fireEvent: async (event: string, data: any, ctx: any = {}) => {
       const handlers = eventHandlers.get(event) || [];
       let lastResult: any;
@@ -107,8 +108,8 @@ describe("claudeMemPlugin", () => {
     assert.ok(getCommand("claude_mem_status"), "status command should be registered");
     assert.ok(getEventHandlers("session_start").length > 0, "session_start handler registered");
     assert.ok(getEventHandlers("after_compaction").length > 0, "after_compaction handler registered");
-    assert.ok(getEventHandlers("before_agent_start").length > 0, "before_agent_start handler registered");
     assert.ok(getEventHandlers("before_prompt_build").length > 0, "before_prompt_build handler registered");
+    assert.ok(getEventHandlers("before_tool_call").length > 0, "before_tool_call handler registered");
     assert.ok(getEventHandlers("tool_result_persist").length > 0, "tool_result_persist handler registered");
     assert.ok(getEventHandlers("agent_end").length > 0, "agent_end handler registered");
     assert.ok(getEventHandlers("gateway_start").length > 0, "gateway_start handler registered");
@@ -347,25 +348,78 @@ describe("Observation I/O event handlers", () => {
     assert.equal(initRequests.length, 1, "should re-init after compaction");
   });
 
-  it("before_agent_start calls init for session privacy check", async () => {
+  it("before_prompt_build calls init for session privacy check", async () => {
     const { api, fireEvent } = createMockApi({ workerPort });
     claudeMemPlugin(api);
 
-    await fireEvent("before_agent_start", { prompt: "hello" }, {});
+    await fireEvent("before_prompt_build", { prompt: "hello", messages: [] }, {});
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     const initRequests = receivedRequests.filter((r) => r.url === "/api/sessions/init");
-    assert.equal(initRequests.length, 1, "before_agent_start should init session");
+    assert.equal(initRequests.length, 1, "before_prompt_build should init session");
+  });
+
+  // PLATENG-1228 / OpenClaw 2026.8.1: the gateway rejects any api.on() name
+  // outside pluginHookNameSet with `unknown typed hook "<name>" ignored`, so a
+  // stale name is a silent no-op. This list is that set, read from
+  // src/plugins/hook-types.ts in openclaw/openclaw:2026.8.1.
+  const OPENCLAW_2026_8_1_HOOKS = new Set([
+    "before_model_resolve", "agent_turn_prepare", "before_prompt_build",
+    "before_agent_reply", "model_call_started", "model_call_ended",
+    "llm_input", "llm_output", "before_agent_finalize", "agent_end",
+    "before_compaction", "after_compaction", "before_reset", "inbound_claim",
+    "channel_pairing_requested", "message_received", "message_sending",
+    "reply_payload_sending", "message_sent", "before_tool_call",
+    "after_tool_call", "tool_result_persist", "before_message_write",
+    "session_start", "session_end", "subagent_delivery_target",
+    "subagent_spawned", "subagent_progress", "subagent_ended", "gateway_start",
+    "gateway_stop", "heartbeat_prompt_contribution", "cron_reconciled",
+    "cron_changed", "skill_proposal_evaluate", "skill_proposal_changed",
+    "skill_changed", "before_dispatch", "reply_dispatch", "before_install",
+    "before_agent_run", "resolve_exec_env",
+  ]);
+
+  it("registers only hook names OpenClaw 2026.8.1 accepts", () => {
+    const { api, getRegisteredEvents } = createMockApi();
+    claudeMemPlugin(api);
+
+    const unknown = getRegisteredEvents().filter((e) => !OPENCLAW_2026_8_1_HOOKS.has(e));
+    assert.deepEqual(unknown, [], `these hooks would be silently ignored: ${unknown.join(", ")}`);
+  });
+
+  it("captures the real user prompt, not a placeholder", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    const ctx = { sessionKey: "prompt-capture", agentId: "triage-desk-analyst" };
+    await fireEvent("session_start", { sessionId: "s1" }, ctx);
+    await fireEvent(
+      "before_prompt_build",
+      { prompt: "Investigate the failing acme integration build.", messages: [] },
+      ctx,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const prompts = receivedRequests
+      .filter((r) => r.url === "/api/sessions/init")
+      .map((r) => r.body.prompt);
+    assert.ok(
+      prompts.includes("Investigate the failing acme integration build."),
+      `user prompt never reached the worker: ${JSON.stringify(prompts)}`,
+    );
   });
 
   // PLATENG-1228 L1: ticket-scoped memory (openclaw-TD-####).
-  it("before_agent_start keys a specialist session to its ticket project", async () => {
+  it("before_prompt_build keys a specialist session to its ticket project", async () => {
     const { api, fireEvent } = createMockApi({ workerPort });
     claudeMemPlugin(api);
 
     await fireEvent(
-      "before_agent_start",
-      { prompt: "You are the new-step-reviewer for ticket TD-1234. Review the diff." },
+      "before_prompt_build",
+      {
+        prompt: "You are the new-step-reviewer for ticket TD-1234. Review the diff.",
+        messages: [],
+      },
       { sessionKey: "spec-1", agentId: "new-step-reviewer" },
     );
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -375,16 +429,17 @@ describe("Observation I/O event handlers", () => {
     assert.equal(initRequest!.body.project, "openclaw-TD-1234");
   });
 
-  it("tool_result_persist re-keys the orchestrator session via a reproject POST", async () => {
+  it("before_tool_call re-keys the orchestrator session via a reproject POST", async () => {
     const { api, fireEvent } = createMockApi({ workerPort });
     claudeMemPlugin(api);
 
     await fireEvent(
-      "tool_result_persist",
+      "before_tool_call",
       {
-        toolName: "Bash",
+        toolName: "exec",
         params: { command: "cd /home/node/work/.integrations-worktrees/TD-2001/repo && ls" },
-        message: { content: [] },
+        runId: "run-1",
+        toolCallId: "call-1",
       },
       { sessionKey: "orch-1", agentId: "new-step-orchestrator" },
     );
@@ -395,13 +450,96 @@ describe("Observation I/O event handlers", () => {
     assert.equal(reprojectRequest!.body.project, "openclaw-TD-2001");
   });
 
+  it("before_tool_call never blocks or rewrites the tool call", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    const result = await fireEvent(
+      "before_tool_call",
+      {
+        toolName: "exec",
+        params: { command: "cd /home/node/work/.integrations-worktrees/TD-2001/repo && ls" },
+      },
+      { sessionKey: "orch-veto", agentId: "new-step-orchestrator" },
+    );
+
+    assert.equal(result, undefined, "handler must return undefined so the runner skips it");
+  });
+
+  // 2026.8.1 tool_result_persist carries no params at all — discovery there is
+  // structurally dead, so it must not be the path the orchestrator relies on.
+  it("tool_result_persist does not reproject (2026.8.1 sends no params)", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent(
+      "tool_result_persist",
+      {
+        toolName: "exec",
+        message: {
+          content: [
+            { type: "text", text: "/home/node/work/.integrations-worktrees/TD-2001/repo" },
+          ],
+        },
+      },
+      { sessionKey: "orch-2", agentId: "new-step-orchestrator" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.ok(
+      !receivedRequests.some((r) => r.url === "/api/sessions/project"),
+      "tool output text must not re-key a build",
+    );
+  });
+
+  // A wrong cwd is worse than none: the worker derives the project from it, so
+  // process.cwd() = /app created a phantom "app" project the read path never
+  // queries. Omitting cwd leaves the session's project untouched.
+  it("tool_result_persist omits cwd when the context has no workspaceDir", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent("session_start", { sessionId: "s1" }, { sessionKey: "no-wsdir" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    await fireEvent(
+      "tool_result_persist",
+      { toolName: "Read", message: { content: [{ type: "text", text: "contents" }] } },
+      { sessionKey: "no-wsdir" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const obsRequest = receivedRequests.find((r) => r.url === "/api/sessions/observations");
+    assert.ok(obsRequest, "should still send the observation");
+    assert.ok(
+      !("cwd" in obsRequest!.body),
+      `cwd must be omitted, got ${JSON.stringify(obsRequest!.body.cwd)}`,
+    );
+  });
+
+  it("tool_result_persist still sends cwd when the context has a workspaceDir", async () => {
+    const { api, fireEvent } = createMockApi({ workerPort });
+    claudeMemPlugin(api);
+
+    await fireEvent(
+      "tool_result_persist",
+      { toolName: "Read", message: { content: [{ type: "text", text: "contents" }] } },
+      { sessionKey: "with-wsdir", workspaceDir: "/home/node/work/repo" },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const obsRequest = receivedRequests.find((r) => r.url === "/api/sessions/observations");
+    assert.ok(obsRequest, "should send the observation");
+    assert.equal(obsRequest!.body.cwd, "/home/node/work/repo");
+  });
+
   it("leaves a non-build agent under its agent project and never reprojects", async () => {
     const { api, fireEvent } = createMockApi({ workerPort });
     claudeMemPlugin(api);
 
     await fireEvent(
-      "before_agent_start",
-      { prompt: "Select the next integration to build." },
+      "before_prompt_build",
+      { prompt: "Select the next integration to build.", messages: [] },
       { sessionKey: "main-1", agentId: "triage-desk-analyst" },
     );
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -420,14 +558,13 @@ describe("Observation I/O event handlers", () => {
     claudeMemPlugin(api);
 
     const ctx = { sessionKey: "spec-2", agentId: "new-step-coder" };
-    // Discover the ticket from the spawn prompt...
+    // The ticket must be recorded before the inject query is built, in the
+    // same handler — discovery and read happen on one hook now.
     await fireEvent(
-      "before_agent_start",
-      { prompt: "You are the new-step-coder for ticket TD-1234, iteration 2." },
+      "before_prompt_build",
+      { prompt: "You are the new-step-coder for ticket TD-1234, iteration 2.", messages: [] },
       ctx,
     );
-    // ...then the very next prompt build must query the same ticket thread.
-    await fireEvent("before_prompt_build", {}, ctx);
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     const injectRequest = receivedRequests.find(
@@ -687,14 +824,15 @@ describe("before_prompt_build context injection", () => {
     assert.ok(logs.some((l) => l.includes("Context injected via system prompt")));
   });
 
-  it("does not write MEMORY.md on before_agent_start", async () => {
+  it("does not write MEMORY.md on before_prompt_build", async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), "claude-mem-test-"));
     try {
       const { api, fireEvent } = createMockApi({ workerPort });
       claudeMemPlugin(api);
 
-      await fireEvent("before_agent_start", {
+      await fireEvent("before_prompt_build", {
         prompt: "Help me write a function",
+        messages: [],
       }, { sessionKey: "sync-test", workspaceDir: tmpDir });
 
       await new Promise((resolve) => setTimeout(resolve, 200));
@@ -705,7 +843,7 @@ describe("before_prompt_build context injection", () => {
       } catch {
         memoryExists = false;
       }
-      assert.ok(!memoryExists, "MEMORY.md should not be created by before_agent_start");
+      assert.ok(!memoryExists, "MEMORY.md should not be created by before_prompt_build");
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
@@ -717,8 +855,8 @@ describe("before_prompt_build context injection", () => {
       const { api, fireEvent } = createMockApi({ workerPort });
       claudeMemPlugin(api);
 
-      await fireEvent("before_agent_start", {
-        prompt: "Help me write a function",
+      await fireEvent("session_start", {
+        sessionId: "s-tool-sync",
       }, { sessionKey: "tool-sync", workspaceDir: tmpDir });
 
       await new Promise((resolve) => setTimeout(resolve, 200));
@@ -1114,11 +1252,11 @@ describe("circuit breaker", () => {
     await fireEvent("gateway_start", {}, {});
 
     for (let i = 0; i < 4; i++) {
-      await fireEvent("before_agent_start", { prompt: "hello" }, { sessionKey: `cb-open-${i}` });
+      await fireEvent("before_prompt_build", { prompt: "hello", messages: [] }, { sessionKey: `cb-open-${i}` });
     }
 
     const logCountBeforeDrop = logs.length;
-    await fireEvent("before_agent_start", { prompt: "hello" }, { sessionKey: "cb-drop" });
+    await fireEvent("before_prompt_build", { prompt: "hello", messages: [] }, { sessionKey: "cb-drop" });
     const noisyDropLogs = logs.slice(logCountBeforeDrop).filter(
       (l) => l.includes("failed") || l.includes("disabling")
     );
@@ -1132,7 +1270,7 @@ describe("circuit breaker", () => {
     const logsAfterReset = logs.length;
 
     for (let i = 0; i < 3; i++) {
-      await fireEvent("before_agent_start", { prompt: "hello" }, { sessionKey: `cb-log-${i}` });
+      await fireEvent("before_prompt_build", { prompt: "hello", messages: [] }, { sessionKey: `cb-log-${i}` });
     }
 
     const newLogs = logs.slice(logsAfterReset);
@@ -1149,11 +1287,11 @@ describe("circuit breaker", () => {
     await fireEvent("gateway_start", {}, {});
 
     for (let i = 0; i < 4; i++) {
-      await fireEvent("before_agent_start", { prompt: "hello" }, { sessionKey: `cb-reset-${i}` });
+      await fireEvent("before_prompt_build", { prompt: "hello", messages: [] }, { sessionKey: `cb-reset-${i}` });
     }
 
     const logCountWhileOpen = logs.length;
-    await fireEvent("before_agent_start", { prompt: "hello" }, { sessionKey: "cb-while-open" });
+    await fireEvent("before_prompt_build", { prompt: "hello", messages: [] }, { sessionKey: "cb-while-open" });
     assert.equal(
       logs.slice(logCountWhileOpen).filter((l) => l.includes("failed") || l.includes("disabling")).length,
       0,
@@ -1163,7 +1301,7 @@ describe("circuit breaker", () => {
     await fireEvent("gateway_start", {}, {});
 
     const logCountAfterReset = logs.length;
-    await fireEvent("before_agent_start", { prompt: "hello" }, { sessionKey: "cb-after-reset" });
+    await fireEvent("before_prompt_build", { prompt: "hello", messages: [] }, { sessionKey: "cb-after-reset" });
     const newLogs = logs.slice(logCountAfterReset);
     assert.ok(
       newLogs.some((l) => l.includes("failed:") || l.includes("disabling")),
@@ -1177,7 +1315,7 @@ describe("circuit breaker", () => {
     await resetMock.fireEvent("gateway_start", {}, {});
 
     for (let i = 0; i < 4; i++) {
-      await resetMock.fireEvent("before_agent_start", { prompt: "probe-test" }, { sessionKey: `probe-phase1-${i}` });
+      await resetMock.fireEvent("before_prompt_build", { prompt: "probe-test", messages: [] }, { sessionKey: `probe-phase1-${i}` });
     }
 
     const realDateNow = Date.now.bind(Date);
@@ -1200,7 +1338,7 @@ describe("circuit breaker", () => {
       claudeMemPlugin(mockA.api);
 
       const logCountAtProbe = mockA.logs.length;
-      await mockA.fireEvent("before_agent_start", { prompt: "probe" }, { sessionKey: "probe-call-non2xx" });
+      await mockA.fireEvent("before_prompt_build", { prompt: "probe", messages: [] }, { sessionKey: "probe-call-non2xx" });
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       const probeALogs = mockA.logs.slice(logCountAtProbe);
@@ -1210,7 +1348,7 @@ describe("circuit breaker", () => {
       );
 
       const logCountAfterFailedProbe = mockA.logs.length;
-      await mockA.fireEvent("before_agent_start", { prompt: "probe" }, { sessionKey: "probe-concurrent" });
+      await mockA.fireEvent("before_prompt_build", { prompt: "probe", messages: [] }, { sessionKey: "probe-concurrent" });
       await new Promise((resolve) => setTimeout(resolve, 100));
       const droppedLogs = mockA.logs.slice(logCountAfterFailedProbe).filter(
         (l) => l.includes("failed") || l.includes("disabling")
@@ -1225,7 +1363,7 @@ describe("circuit breaker", () => {
 
       Date.now = realDateNow;
       for (let i = 0; i < 4; i++) {
-        await resetMock2.fireEvent("before_agent_start", { prompt: "probe-test" }, { sessionKey: `probe-phase4-${i}` });
+        await resetMock2.fireEvent("before_prompt_build", { prompt: "probe-test", messages: [] }, { sessionKey: `probe-phase4-${i}` });
       }
       Date.now = () => realDateNow() + 31_000;
 
@@ -1245,7 +1383,7 @@ describe("circuit breaker", () => {
       claudeMemPlugin(mockB.api);
 
       const logCountBeforeSuccessProbe = mockB.logs.length;
-      await mockB.fireEvent("before_agent_start", { prompt: "probe" }, { sessionKey: "probe-call-2xx" });
+      await mockB.fireEvent("before_prompt_build", { prompt: "probe", messages: [] }, { sessionKey: "probe-call-2xx" });
       await new Promise((resolve) => setTimeout(resolve, 150));
 
       const successProbeLogs = mockB.logs.slice(logCountBeforeSuccessProbe);
